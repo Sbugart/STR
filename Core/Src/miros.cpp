@@ -33,7 +33,6 @@
 #include "miros.h"
 #include "qassert.h"
 #include "stm32g4xx.h"
-#include "atomic_queue.hpp"
 
 Q_DEFINE_THIS_FILE
 
@@ -47,11 +46,45 @@ uint32_t OS_readySet; /* bitmask of threads that are ready to run */
 uint8_t OS_threadNum; /* number of threads started */
 uint8_t OS_currIdx; /* current thread index for the circular array */
 
-OSThread *OS_aperiodic_thread[32];
+OSAperiodicThread *OS_aperiodic_thread[32];
 uint8_t OS_aperiodic_threadNum;
 AtomicQueue128 OS_aperiodic_queue;
 
+LockGuard::LockGuard() {
+    __enable_irq();			// desativa as interrupções, protocolo NPP
+}
 
+LockGuard::~LockGuard() {
+    __disable_irq();		// ativa as interrupções, protocolo NPP
+}
+
+AtomicQueue128::AtomicQueue128() 	// classe para o recurso compartilhado
+{
+	size = 0;
+	head = 0;
+}
+
+int AtomicQueue128::read(int& out)
+{
+    LockGuard lock;
+	if(size == 0) return -1;
+
+	out = buffer[head];
+	head = (head+1)%BUFFER_CAPACITY;
+	size--;
+
+	return 0;
+}
+
+int AtomicQueue128::write(int in)
+{
+    LockGuard lock;
+	if(size == BUFFER_CAPACITY) return -1;
+
+	buffer[(head+size)%BUFFER_CAPACITY] = in;
+	size++;
+	return 0;
+}
 
 
 static int32_t OS_random_int32(uint32_t max_magnitude) {
@@ -81,7 +114,7 @@ void OS_init(void *stkSto, uint32_t stkSize) {
     /* start idleThread thread */
     OSThread_start(&idleThread,
                    &main_idleThread,
-                   stkSto, 400, 0, stkSize);
+                   stkSto, 400, stkSize);
 }
 
 void OS_sched(void) {
@@ -121,6 +154,7 @@ void OS_tick(void) {
     static uint32_t ticks = 0U;
     ticks++;
     OSThread *curr_thread;
+    OSAperiodicThread *curr_aperiodic_thread;
 
 	uint8_t n = 0;
 	for(n=1U;n<OS_threadNum; n++){ 				/* cycle through every thread but the idle */
@@ -141,9 +175,9 @@ void OS_tick(void) {
         }
     }
     for(n=0U;n<OS_aperiodic_threadNum;n++){     /* Passa por todas as tarefas aperiódicas */
-        curr_thread = OS_aperiodic_thread[n];
-        if (ticks % curr_thread->period_ticks + curr_thread->current_period_deviation == 0U) {
-            curr_thread->current_period_deviation = OS_random_int32(curr_thread->max_random_period_deviation);  /* Escolhe um novo período aleatório */
+        curr_aperiodic_thread = OS_aperiodic_thread[n];
+        if (ticks == curr_aperiodic_thread->next_arrival_tick) { /* Se chegou o tempo de executar a tarefa aperiódica */
+            curr_aperiodic_thread->next_arrival_tick += curr_aperiodic_thread->period_ticks + OS_random_int32(curr_aperiodic_thread->max_random_period_deviation);
             OS_aperiodic_queue.write(n);        /* Coloca a tarefa na fila */
         }
     }
@@ -203,7 +237,7 @@ static void thread_wrapper() {
 void OSThread_start(
     OSThread *me,
     OSThreadHandler threadHandler,
-    void *stkSto, uint32_t period_ticks, uint32_t max_random_period_deviation, uint32_t stkSize)
+    void *stkSto, uint32_t period_ticks, uint32_t stkSize)
 {
     /* round down the stack top to the 8-byte boundary
     * NOTE: ARM Cortex-M stack grows down from hi -> low memory
@@ -217,8 +251,7 @@ void OSThread_start(
     Q_REQUIRE((OS_threadNum < Q_DIM(OS_thread)) && (OS_thread[OS_threadNum] == (OSThread *)0));
 
     *(--sp) = (1U << 24);  /* xPSR */
-    if(max_random_period_deviation) *(--sp) = (uint32_t)threadHandler;
-    else *(--sp) = (uint32_t)thread_wrapper; /* PC */
+    *(--sp) = (uint32_t)thread_wrapper; /* PC */
     *(--sp) = 0x0000000EU; /* LR  */
     *(--sp) = 0x0000000CU; /* R12 */
     *(--sp) = 0x00000003U; /* R3  */
@@ -245,10 +278,6 @@ void OSThread_start(
 
     me->start_pc = (uint32_t)threadHandler;
 
-    me->max_random_period_deviation = max_random_period_deviation; /* Simulation of aperiodic tasks */
-
-    me->current_period_deviation = 0;
-
     /* round up the bottom of the stack to the 8-byte boundary */
     stk_limit = (uint32_t *)(((((uint32_t)stkSto - 1U) / 8) + 1U) * 8);
 
@@ -257,11 +286,6 @@ void OSThread_start(
         *sp = 0xDEADBEEFU;
     }
 
-    if (max_random_period_deviation) {
-        OS_aperiodic_thread[OS_aperiodic_threadNum] = me;
-        OS_aperiodic_threadNum ++;
-        return;
-    }
     /* register the thread with the OS */
     OS_insert_thread(me);
 
@@ -271,6 +295,64 @@ void OSThread_start(
         OS_readySet |= (1U << (OS_threadNum - 2U));
     }
 }
+void OSAperiodicThread_start(
+    OSAperiodicThread *me,
+    OSThreadHandler threadHandler,
+    void *stkSto, uint32_t period_ticks, uint32_t max_random_period_deviation, uint32_t stkSize)
+{
+    /* round down the stack top to the 8-byte boundary
+    * NOTE: ARM Cortex-M stack grows down from hi -> low memory
+    */
+    uint32_t *sp = (uint32_t *)((((uint32_t)stkSto + stkSize) / 8) * 8);
+    uint32_t *stk_limit;
+
+    /* thread number must be in ragne
+    * and must be unused
+    */
+    Q_REQUIRE((OS_aperiodic_threadNum < Q_DIM(OS_aperiodic_thread)) && (OS_aperiodic_thread[OS_aperiodic_threadNum] == (OSAperiodicThread *)0));
+
+    *(--sp) = (1U << 24);  /* xPSR */
+    *(--sp) = (uint32_t)threadHandler; /* PC */
+    *(--sp) = 0x0000000EU; /* LR  */
+    *(--sp) = 0x0000000CU; /* R12 */
+    *(--sp) = 0x00000003U; /* R3  */
+    *(--sp) = 0x00000002U; /* R2  */
+    *(--sp) = 0x00000001U; /* R1  */
+    *(--sp) = 0x00000000U; /* R0  */
+    /* additionally, fake registers R4-R11 */
+    *(--sp) = 0x0000000BU; /* R11 */
+    *(--sp) = 0x0000000AU; /* R10 */
+    *(--sp) = 0x00000009U; /* R9 */
+    *(--sp) = 0x00000008U; /* R8 */
+    *(--sp) = 0x00000007U; /* R7 */
+    *(--sp) = 0x00000006U; /* R6 */
+    *(--sp) = 0x00000005U; /* R5 */
+    *(--sp) = 0x00000004U; /* R4 */
+
+    /* save the top of the stack in the thread's attibute */
+    me->sp = sp;
+    me->start_pc = (uint32_t)threadHandler; /* save the start address of the thread */
+
+    me->period_ticks = period_ticks; /* save the period in the thread's attribute */
+    me->max_random_period_deviation = max_random_period_deviation; /* save the max random period deviation */
+    me->next_arrival_tick = 1U + period_ticks + OS_random_int32(me->max_random_period_deviation); /* set the next arrival tick */
+
+     /* round up the bottom of the stack to the 8-byte boundary */
+    stk_limit = (uint32_t *)(((((uint32_t)stkSto - 1U) / 8) + 1U) * 8);
+
+    /* pre-fill the unused part of the stack with 0xDEADBEEF */
+    for (sp = sp - 1U; sp >= stk_limit; --sp) {
+        *sp = 0xDEADBEEFU;
+    }
+
+    /* register the thread with the OS */
+    OS_aperiodic_thread[OS_aperiodic_threadNum] = me;
+    OS_aperiodic_threadNum++;
+}
+
+
+
+
 /***********************************************/
 void SystemClock_Config(void)
 {
@@ -329,9 +411,7 @@ void OS_onIdle(void) {
 #endif
     int n;
 
-    __asm volatile ("cpsid i");             /* impede que um OS_Tick aconteça enquanto fila está sendo lida */
     int result = OS_aperiodic_queue.read(n);        /* Se tiver thread aperiodica na fila, execute*/
-    __asm volatile ("cpsie i");
 
     if(result == 0) {
         ((OSThreadHandler)OS_aperiodic_thread[n]->start_pc)();
