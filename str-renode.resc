@@ -1,0 +1,32 @@
+#logFile $ORIGIN/str-miros-renode.log True
+
+using sysbus
+$name?="nucleo_g474re"
+$binpath?=$ORIGIN/Debug/str-miros-stm32.elf
+
+mach create $name
+
+machine LoadPlatformDescription $ORIGIN/nucleog474re.repl
+#machine EnableProfiler $ORIGIN/metrics.dump
+
+#showAnalyzer sysbus.usart2
+logLevel -1 nvic0
+logLevel -1 cpu0
+logLevel 0
+sysbus.cpu0 LogFunctionNames True
+
+set osPanicHook
+"""
+self.ErrorLog("OS Panicked")
+"""
+#cpu0 AddSymbolHook "z_fatal_error" $osPanicHook
+
+machine StartGdbServer 3333
+
+macro reset
+"""
+    sysbus LoadELF $binpath
+    cpu0 VectorTableOffset 0x8000000
+"""
+
+runMacro $reset
