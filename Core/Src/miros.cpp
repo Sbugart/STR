@@ -285,6 +285,8 @@ void OSThread_start(
     for (sp = sp - 1U; sp >= stk_limit; --sp) {
         *sp = 0xDEADBEEFU;
     }
+    int a = 0;
+    a ++;
 
     /* register the thread with the OS */
     OS_insert_thread(me);
@@ -351,9 +353,6 @@ void OSAperiodicThread_start(
 }
 
 
-
-
-/***********************************************/
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};

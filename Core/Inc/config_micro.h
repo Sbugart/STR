@@ -13,7 +13,6 @@
 extern I2C_HandleTypeDef hi2c1;
 extern TIM_HandleTypeDef htim20;
 
-void SystemClock_Config(void);
 void MX_GPIO_Init(void);
 void MX_TIM20_Init(void);
 void MX_I2C1_Init(void);

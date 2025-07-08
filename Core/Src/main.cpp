@@ -1,6 +1,7 @@
 
 /* USER CODE BEGIN Includes */
 #include "main.h"
+#include "miros.h"
 #include "stm32g4xx_hal_conf.h"
 #include "Pid.h"
 #include "stdio.h"
@@ -10,6 +11,10 @@ extern "C"{
   #include "config_micro.h"
 }
 /* USER CODE END Includes */
+
+
+
+
 
 // ======== DEFINIÇÕES ========
 #define VL53L0X_ADDR (0x52) // 7-bit left-shifted
@@ -24,16 +29,22 @@ const float SAIDA_MAX = 0.3f;    // SAIDA_MAX - maximum value of manipulated var
 const float SAIDA_MIN = -0.3f;   // SAIDA_MIN - minimum value of manipulated variable
 
 PID pid = PID(DT, SAIDA_MAX, SAIDA_MIN, KP, KD, KI);
-float saidaPID = 0.0f;
 const uint16_t setPoint = 200;
 
 // ======== STACKS DAS THREADS ========
-uint32_t stackControlador[40];
+uint32_t stackControlador[400];
 uint32_t stackGerarPWM[40];
+uint32_t stackSensor[400];
+
+uint16_t distancia;
+float saidaPID = 0.0f;
+
 
 // ======== DEFINIÇÃO DAS THREADS ========
-//OSThread threadControlador;
-//OSThread threadGerarPWM;
+
+rtos::OSThread threadControlador;
+rtos::OSThread threadGerarPWM;
+rtos::OSThread threadSensor;
 
 // ======== FUNÇÕES DO SENSOR VL53L0X ========
 HAL_StatusTypeDef VL53L0X_InitSimple(void)
@@ -54,7 +65,7 @@ HAL_StatusTypeDef VL53L0X_InitSimple(void)
   return ret;
 }
 
-HAL_StatusTypeDef VL53L0X_ReadSingleSimple(uint16_t *distance)
+HAL_StatusTypeDef VL53L0X_ReadSingleSimple()
 {
   HAL_StatusTypeDef ret;
   uint8_t cmd = 0x01;
@@ -76,24 +87,31 @@ HAL_StatusTypeDef VL53L0X_ReadSingleSimple(uint16_t *distance)
   ret = HAL_I2C_Mem_Write(&hi2c1, VL53L0X_ADDR, 0xC0, I2C_MEMADD_SIZE_8BIT, &clearInterrupt, 1, 100);
   if (ret != HAL_OK) return ret;
 
-  *distance = (rangeData[0] << 8) | rangeData[1];
+  rtos::LockGuard mutex;
+  distancia = (rangeData[0] << 8) | rangeData[1];
   return ret;
 }
 
 // ======== FUNÇÕES DE CONTROLE ========
-void AtualizarControle(uint16_t distancia) {
+void AtualizarControle() {
     // Se quiser proteger região crítica:
-    // OS_NPP_enterCriticalRegion();
+	rtos::LockGuard mutex;
     saidaPID = pid.calculate(setPoint, distancia);
     saidaPID += 0.61;
-    // OS_NPP_exitCriticalRegion();
 }
 
 void AplicarPWM(void) {
-    // OS_NPP_enterCriticalRegion();
-    Motor_SetPower(saidaPID); // Define % da potência do motor
-    // OS_NPP_exitCriticalRegion();
+	static bool alto = false;
+    rtos::LockGuard mutex;
+    if(alto){
+    	Motor_SetPower(20); // Define % da potência do motor
+    } else {
+    	Motor_SetPower(70);
+    }
+    alto = !alto;
 }
+
+uint32_t stack_idleThread[40];
 
 // ======== MAIN ========
 int main(void){
@@ -101,10 +119,10 @@ int main(void){
 
 	// ======== Inicializações ========
     HAL_Init();
-    SystemClock_Config();
+    //SystemClock_Config();
     MX_GPIO_Init();
     MX_TIM20_Init();
-    MX_I2C1_Init();
+    //MX_I2C1_Init();
 
     // Configuração do GPIO
 	__HAL_RCC_GPIOA_CLK_ENABLE();
@@ -114,25 +132,16 @@ int main(void){
 	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
 	//Start do sensor e PWM
-	VL53L0X_InitSimple();
+	//VL53L0X_InitSimple();
 	HAL_TIM_PWM_Start(&htim20, TIM_CHANNEL_2);
 
+	rtos::OS_init(stack_idleThread, sizeof(stack_idleThread));
 
-	uint16_t distanciaAtual = 0;
+	rtos::OSThread_start(&threadGerarPWM,
+							 &AplicarPWM,
+							 stackGerarPWM, 10000, sizeof(stackGerarPWM));
 
-  /* USER CODE END 2 */
-
-/* USER CODE BEGIN WHILE */
-	while (1) {
-
-		// uint16_t distance is the distance in millimeters.
-		// statInfo_t_VL53L0X distanceStr is the statistics read from the sensor.
-		VL53L0X_ReadSingleSimple(&distanciaAtual);
-		AtualizarControle(distanciaAtual);
-		AplicarPWM();
-
-	}
-	/* USER CODE END WHILE */
+	rtos::OS_run();
 }
 
 
